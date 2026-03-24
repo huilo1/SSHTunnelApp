@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SSH Tunnel VPN</string>
+    <string name="connect">Connect</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="status_disconnected">Disconnected</string>
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_connected">Connected</string>
+    <string name="status_error">Error</string>
+    <string name="add_server">Add Server</string>
+    <string name="edit_server">Edit Server</string>
+    <string name="delete_server">Delete</string>
+    <string name="server_name">Name</string>
+    <string name="server_host">Host</string>
+    <string name="server_port">SSH Port</string>
+    <string name="username">Username</string>
+    <string name="password">Password</string>
+    <string name="private_key">Private Key (PEM)</string>
+    <string name="auth_method">Authentication</string>
+    <string name="auth_password">Password</string>
+    <string name="auth_key">SSH Key</string>
+    <string name="save">Save</string>
+    <string name="cancel">Cancel</string>
+    <string name="no_servers">No servers configured.\nTap + to add one.</string>
+    <string name="notification_channel">SSH Tunnel VPN</string>
+    <string name="notification_connected">VPN connected via %s</string>
+    <string name="vpn_permission_denied">VPN permission denied</string>
+    <string name="confirm_delete">Delete server \"%s\"?</string>
+    <string name="dns_server">DNS Server</string>
+    <string name="dns_default">8.8.8.8</string>
+</resources>

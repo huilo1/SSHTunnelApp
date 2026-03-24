@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="primary">#1B5E20</color>
+    <color name="primary_container">#A5D6A7</color>
+    <color name="on_primary">#FFFFFF</color>
+    <color name="secondary">#33691E</color>
+    <color name="connected_green">#4CAF50</color>
+    <color name="disconnected_gray">#9E9E9E</color>
+    <color name="error_red">#F44336</color>
+    <color name="connecting_orange">#FF9800</color>
+</resources>
