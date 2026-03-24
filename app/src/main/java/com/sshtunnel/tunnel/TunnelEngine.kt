@@ -1,27 +1,29 @@
 package com.sshtunnel.tunnel
 
 import android.util.Log
-import com.jcraft.jsch.ChannelDirectTCPIP
-import com.jcraft.jsch.Session
 import com.sshtunnel.service.SshVpnService
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Core engine: reads IP packets from TUN fd, manages TCP/UDP sessions,
- * forwards traffic through SSH channels.
+ * forwards traffic through a local SOCKS5 proxy (backed by SSH dynamic forwarding).
  */
 class TunnelEngine(
     private val tunFdIn: FileInputStream,
     private val tunFdOut: FileOutputStream,
-    private val sshSession: Session,
-    private val dnsServer: String = "8.8.8.8",
-    private val protectSocket: (Int) -> Boolean
+    private val socksPort: Int,
+    private val dnsServer: String = "8.8.8.8"
 ) {
     companion object {
         private const val TAG = "TunnelEngine"
@@ -33,6 +35,8 @@ class TunnelEngine(
     private val executor: ExecutorService = Executors.newCachedThreadPool()
     private val outputLock = Any()
     private val logBuffer get() = SshVpnService.logBuffer
+    // Allow more concurrent SOCKS5 connections for better throughput
+    private val connectSemaphore = Semaphore(8)
 
     private fun log(msg: String, e: Throwable? = null) {
         if (e != null) {
@@ -46,7 +50,7 @@ class TunnelEngine(
 
     fun start() {
         running.set(true)
-        log("Tunnel engine started")
+        log("Tunnel engine started (SOCKS5 port=$socksPort)")
         executor.submit { readLoop() }
     }
 
@@ -57,6 +61,8 @@ class TunnelEngine(
         tcpSessions.clear()
         executor.shutdownNow()
     }
+
+    // ── TUN read loop ──────────────────────────────────────────────
 
     private fun readLoop() {
         val buf = ByteArray(MTU)
@@ -86,6 +92,8 @@ class TunnelEngine(
         }
     }
 
+    // ── TCP handling ───────────────────────────────────────────────
+
     private fun handleTcp(buf: ByteArray, len: Int, ipHeaderLen: Int) {
         val srcIp = Packet.srcAddr(buf)
         val dstIp = Packet.dstAddr(buf)
@@ -93,7 +101,6 @@ class TunnelEngine(
         val dstPort = Packet.dstPort(buf, ipHeaderLen)
         val flags = Packet.tcpFlagByte(buf, ipHeaderLen)
         val seqNum = Packet.tcpSeqNum(buf, ipHeaderLen)
-        val ackNum = Packet.tcpAckNum(buf, ipHeaderLen)
         val tcpHeaderLen = Packet.tcpHeaderLen(buf, ipHeaderLen)
         val payloadStart = ipHeaderLen + tcpHeaderLen
         val payloadLen = len - payloadStart
@@ -106,11 +113,7 @@ class TunnelEngine(
         }
 
         if (flags and Packet.TCP_SYN != 0 && flags and Packet.TCP_ACK == 0) {
-            // New connection
-            val session = TcpSession(
-                key = key,
-                theirSeqNum = seqNum
-            )
+            val session = TcpSession(key = key, theirSeqNum = seqNum)
             tcpSessions[key] = session
 
             // Send SYN-ACK
@@ -125,9 +128,8 @@ class TunnelEngine(
             session.mySeqNum++
             session.theirSeqNum = seqNum + 1
 
-            // Open SSH channel in background
-            log("New TCP: ${Packet.intToIp(srcIp)}:$srcPort -> ${Packet.intToIp(dstIp)}:$dstPort")
-            executor.submit { openSshChannel(session) }
+            Log.d(TAG, "TCP ${Packet.intToIp(dstIp)}:$dstPort")
+            executor.submit { openSocksConnection(session) }
             return
         }
 
@@ -139,7 +141,6 @@ class TunnelEngine(
 
         if (flags and Packet.TCP_FIN != 0) {
             session.theirSeqNum = seqNum + payloadLen.toLong() + 1
-            // Send ACK for FIN
             val finAck = Packet.buildTcpPacket(
                 srcIp = dstIp, dstIp = srcIp,
                 srcPort = dstPort, dstPort = srcPort,
@@ -158,7 +159,6 @@ class TunnelEngine(
         if (payloadLen > 0 && session.state == TcpState.ESTABLISHED) {
             session.theirSeqNum = seqNum + payloadLen
 
-            // ACK the data
             val ack = Packet.buildTcpPacket(
                 srcIp = dstIp, dstIp = srcIp,
                 srcPort = dstPort, dstPort = srcPort,
@@ -168,47 +168,104 @@ class TunnelEngine(
             )
             writeTun(ack)
 
-            // Forward data through SSH
             val payload = buf.copyOfRange(payloadStart, payloadStart + payloadLen)
-            executor.submit {
-                try {
-                    session.sshOutputStream?.write(payload)
-                    session.sshOutputStream?.flush()
-                } catch (e: Exception) {
-                    Log.e(TAG, "SSH write error", e)
-                    sendRst(session)
-                }
+            // Buffer data; it will be sent in-order by the session's write thread
+            synchronized(session) {
+                session.pendingData.add(payload)
+            }
+            // Kick the write flush (single-threaded per session via flag)
+            if (session.sshOutputStream != null && !session.closed.get()) {
+                executor.submit { flushPendingData(session) }
             }
         }
     }
 
-    private fun openSshChannel(session: TcpSession) {
+    // ── SOCKS5 connection ──────────────────────────────────────────
+
+    private fun openSocksConnection(session: TcpSession) {
         try {
-            val dstHost = Packet.intToIp(session.key.dstIp)
+            val dstIp = session.key.dstIp
             val dstPort = session.key.dstPort
+            val dstHost = Packet.intToIp(dstIp)
 
-            log("Opening SSH channel -> $dstHost:$dstPort")
-            val channel = sshSession.openChannel("direct-tcpip") as ChannelDirectTCPIP
-            channel.setHost(dstHost)
-            channel.setPort(dstPort)
-            channel.connect(10000)
-            log("SSH channel connected -> $dstHost:$dstPort")
+            connectSemaphore.acquire()
+            val socket: Socket
+            try {
+                socket = connectViaSocks5(dstIp, dstPort)
+            } finally {
+                connectSemaphore.release()
+            }
 
-            session.sshOutputStream = channel.outputStream
-            session.sshInputStream = channel.inputStream
-            session.channelObject = channel
+            session.channelObject = socket
+            session.sshInputStream = socket.getInputStream()
+            val os = socket.getOutputStream()
 
-            // Read SSH responses and send back through TUN
-            executor.submit { sshReadLoop(session) }
+            // Flush any data buffered while SOCKS5 was connecting
+            synchronized(session) {
+                session.sshOutputStream = os
+                for (data in session.pendingData) {
+                    os.write(data)
+                }
+                if (session.pendingData.isNotEmpty()) {
+                    os.flush()
+                }
+                session.pendingData.clear()
+            }
+
+            executor.submit { socksReadLoop(session) }
 
         } catch (e: Exception) {
-            log("SSH channel FAILED -> ${Packet.intToIp(session.key.dstIp)}:${session.key.dstPort}", e)
+            log("SOCKS5 FAILED -> ${Packet.intToIp(session.key.dstIp)}:${session.key.dstPort}", e)
             sendRst(session)
         }
     }
 
-    private fun sshReadLoop(session: TcpSession) {
-        val buf = ByteArray(MTU - 40) // Leave room for IP+TCP headers
+    private fun connectViaSocks5(dstIp: Int, dstPort: Int): Socket {
+        val socket = Socket()
+        socket.connect(InetSocketAddress("127.0.0.1", socksPort), 10000)
+
+        val out = socket.getOutputStream()
+        val inp = socket.getInputStream()
+
+        // SOCKS5 greeting: version 5, 1 method (no auth)
+        out.write(byteArrayOf(0x05, 0x01, 0x00))
+        out.flush()
+
+        val greetResp = ByteArray(2)
+        readFully(inp, greetResp)
+        if (greetResp[0] != 0x05.toByte() || greetResp[1] != 0x00.toByte()) {
+            socket.close()
+            throw IOException("SOCKS5 auth rejected: ${greetResp[0].toInt() and 0xFF}, ${greetResp[1].toInt() and 0xFF}")
+        }
+
+        // SOCKS5 CONNECT to IPv4 destination
+        val req = byteArrayOf(
+            0x05, 0x01, 0x00, 0x01, // ver, CONNECT, rsv, IPv4
+            ((dstIp shr 24) and 0xFF).toByte(),
+            ((dstIp shr 16) and 0xFF).toByte(),
+            ((dstIp shr 8) and 0xFF).toByte(),
+            (dstIp and 0xFF).toByte(),
+            ((dstPort shr 8) and 0xFF).toByte(),
+            (dstPort and 0xFF).toByte()
+        )
+        out.write(req)
+        out.flush()
+
+        // Read CONNECT response (minimum 10 bytes for IPv4 reply)
+        val resp = ByteArray(10)
+        readFully(inp, resp)
+        if (resp[1] != 0x00.toByte()) {
+            socket.close()
+            throw IOException("SOCKS5 CONNECT refused: status=${resp[1].toInt() and 0xFF}")
+        }
+
+        return socket
+    }
+
+    private fun socksReadLoop(session: TcpSession) {
+        val dstHost = Packet.intToIp(session.key.dstIp)
+        val dstPort = session.key.dstPort
+        val buf = ByteArray(MTU - 40)
         try {
             while (running.get() && !session.closed.get()) {
                 val len = session.sshInputStream?.read(buf) ?: -1
@@ -230,11 +287,10 @@ class TunnelEngine(
             }
         } catch (e: Exception) {
             if (!session.closed.get()) {
-                Log.d(TAG, "SSH read ended for session", e)
+                Log.d(TAG, "SOCKS read ended for session", e)
             }
         }
 
-        // Connection ended from remote side, send FIN
         if (!session.closed.get()) {
             val fin = Packet.buildTcpPacket(
                 srcIp = session.key.dstIp,
@@ -252,6 +308,8 @@ class TunnelEngine(
         }
     }
 
+    // ── UDP / DNS handling ─────────────────────────────────────────
+
     private fun handleUdp(buf: ByteArray, len: Int, ipHeaderLen: Int) {
         val srcIp = Packet.srcAddr(buf)
         val dstIp = Packet.dstAddr(buf)
@@ -264,21 +322,25 @@ class TunnelEngine(
 
         val payload = buf.copyOfRange(udpPayloadStart, udpPayloadStart + udpPayloadLen)
 
-        // Forward all UDP (including DNS) through SSH
-        log("UDP: ${Packet.intToIp(srcIp)}:$srcPort -> ${Packet.intToIp(dstIp)}:$dstPort (${udpPayloadLen}b)")
         executor.submit {
             try {
                 val targetHost = if (dstPort == 53) dnsServer else Packet.intToIp(dstIp)
+                val targetIp = Packet.ipToInt(targetHost)
                 val targetPort = dstPort
 
-                val channel = sshSession.openChannel("direct-tcpip") as ChannelDirectTCPIP
-                channel.setHost(targetHost)
-                channel.setPort(targetPort)
+                connectSemaphore.acquire()
+                val socket: Socket
+                try {
+                    socket = connectViaSocks5(targetIp, targetPort)
+                } finally {
+                    connectSemaphore.release()
+                }
+
+                val os = socket.getOutputStream()
+                val ins = socket.getInputStream()
 
                 if (dstPort == 53) {
                     // DNS over TCP: prepend 2-byte length
-                    channel.connect(5000)
-                    val os = channel.outputStream
                     val tcpDns = ByteArray(payload.size + 2)
                     tcpDns[0] = ((payload.size shr 8) and 0xFF).toByte()
                     tcpDns[1] = (payload.size and 0xFF).toByte()
@@ -286,42 +348,23 @@ class TunnelEngine(
                     os.write(tcpDns)
                     os.flush()
 
-                    val ins = channel.inputStream
-                    // Read 2-byte length prefix
                     val lenBuf = ByteArray(2)
-                    var read = 0
-                    while (read < 2) {
-                        val r = ins.read(lenBuf, read, 2 - read)
-                        if (r <= 0) break
-                        read += r
-                    }
-                    if (read == 2) {
-                        val respLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
-                        val respBuf = ByteArray(respLen)
-                        read = 0
-                        while (read < respLen) {
-                            val r = ins.read(respBuf, read, respLen - read)
-                            if (r <= 0) break
-                            read += r
-                        }
-                        if (read == respLen) {
-                            val response = Packet.buildUdpPacket(
-                                srcIp = dstIp, dstIp = srcIp,
-                                srcPort = dstPort, dstPort = srcPort,
-                                payload = respBuf
-                            )
-                            writeTun(response)
-                        }
-                    }
-                    channel.disconnect()
-                } else {
-                    // Non-DNS UDP - best effort through TCP channel
-                    channel.connect(5000)
-                    channel.outputStream.write(payload)
-                    channel.outputStream.flush()
+                    readFully(ins, lenBuf)
+                    val respLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
+                    val respBuf = ByteArray(respLen)
+                    readFully(ins, respBuf)
 
+                    val response = Packet.buildUdpPacket(
+                        srcIp = dstIp, dstIp = srcIp,
+                        srcPort = dstPort, dstPort = srcPort,
+                        payload = respBuf
+                    )
+                    writeTun(response)
+                } else {
+                    os.write(payload)
+                    os.flush()
                     val respBuf = ByteArray(MTU)
-                    val respLen = channel.inputStream.read(respBuf)
+                    val respLen = ins.read(respBuf)
                     if (respLen > 0) {
                         val response = Packet.buildUdpPacket(
                             srcIp = dstIp, dstIp = srcIp,
@@ -330,11 +373,43 @@ class TunnelEngine(
                         )
                         writeTun(response)
                     }
-                    channel.disconnect()
                 }
+                socket.close()
             } catch (e: Exception) {
                 Log.d(TAG, "UDP forward failed for ${Packet.intToIp(dstIp)}:$dstPort", e)
             }
+        }
+    }
+
+    // ── Utility ────────────────────────────────────────────────────
+
+    private fun flushPendingData(session: TcpSession) {
+        try {
+            val os = session.sshOutputStream ?: return
+            val toSend: List<ByteArray>
+            synchronized(session) {
+                if (session.pendingData.isEmpty()) return
+                toSend = session.pendingData.toList()
+                session.pendingData.clear()
+            }
+            for (data in toSend) {
+                os.write(data)
+            }
+            os.flush()
+        } catch (e: Exception) {
+            if (!session.closed.get()) {
+                Log.e(TAG, "SOCKS write error", e)
+                sendRst(session)
+            }
+        }
+    }
+
+    private fun readFully(inp: InputStream, buf: ByteArray) {
+        var offset = 0
+        while (offset < buf.size) {
+            val n = inp.read(buf, offset, buf.size - offset)
+            if (n <= 0) throw IOException("Unexpected EOF in SOCKS5")
+            offset += n
         }
     }
 
@@ -357,7 +432,7 @@ class TunnelEngine(
         if (!session.closed.compareAndSet(false, true)) return
         try { session.sshInputStream?.close() } catch (_: Exception) {}
         try { session.sshOutputStream?.close() } catch (_: Exception) {}
-        try { (session.channelObject as? ChannelDirectTCPIP)?.disconnect() } catch (_: Exception) {}
+        try { (session.channelObject as? Socket)?.close() } catch (_: Exception) {}
     }
 
     private fun writeTun(packet: ByteArray) {

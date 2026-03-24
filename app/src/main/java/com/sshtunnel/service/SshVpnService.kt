@@ -186,43 +186,99 @@ class SshVpnService : VpnService() {
                 log("Server version: ${session.serverVersion}")
                 log("Client version: ${session.clientVersion}")
 
-                // --- DIAGNOSTIC: test direct-tcpip BEFORE VPN ---
-                log("=== DIAG: testing direct-tcpip BEFORE VPN ===")
-                try {
-                    val testCh = session.openChannel("direct-tcpip") as com.jcraft.jsch.ChannelDirectTCPIP
-                    testCh.setHost("8.8.8.8")
-                    testCh.setPort(53)
-                    testCh.connect(5000)
-                    log("DIAG: direct-tcpip BEFORE VPN -> SUCCESS")
-                    testCh.disconnect()
-                } catch (e: Exception) {
-                    log("DIAG: direct-tcpip BEFORE VPN -> FAILED", e)
-                }
+                // 2. Start SOCKS5 proxy on the server via exec channel,
+                //    then forward a local port to it — only 2 SSH channels total.
+                val remoteSocksPort = 18080
+                val localSocksPort = 10800
+                log("Starting remote SOCKS5 proxy on server port $remoteSocksPort...")
 
-                // Also test exec channel
-                log("=== DIAG: testing exec channel ===")
-                try {
-                    val execCh = session.openChannel("exec") as com.jcraft.jsch.ChannelExec
-                    execCh.setCommand("echo tunnel_test_ok")
-                    execCh.inputStream = null
-                    val execIn = execCh.inputStream
-                    execCh.connect(5000)
-                    val result = execIn.bufferedReader().readText().trim()
-                    log("DIAG: exec channel -> SUCCESS, output='$result'")
-                    execCh.disconnect()
-                } catch (e: Exception) {
-                    log("DIAG: exec channel -> FAILED", e)
-                }
+                val socksScript = """
+import socket,select,struct,threading,sys,signal
+signal.signal(signal.SIGTERM,lambda *a:sys.exit(0))
+def h(c):
+ try:
+  c.settimeout(30);c.recv(256);c.send(b'\x05\x00')
+  d=c.recv(256);a=d[3]
+  if a==1:addr=socket.inet_ntoa(d[4:8]);p=struct.unpack('!H',d[8:10])[0]
+  elif a==3:n=d[4];addr=d[5:5+n].decode();p=struct.unpack('!H',d[5+n:7+n])[0]
+  else:c.close();return
+  r=socket.create_connection((addr,p),10);r.settimeout(None);c.settimeout(None)
+  c.send(b'\x05\x00\x00\x01'+socket.inet_aton(r.getsockname()[0])+struct.pack('!H',r.getsockname()[1]))
+  while 1:
+   rs,_,_=select.select([c,r],[],[],120)
+   if not rs:break
+   for s in rs:
+    d=s.recv(32768)
+    if not d:return
+    (r if s is c else c).sendall(d)
+ except:pass
+ finally:
+  try:c.close()
+  except:pass
+s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('127.0.0.1',int(sys.argv[1])));s.listen(128);print('SOCKS5_READY')
+sys.stdout.flush()
+while 1:
+ c,_=s.accept();threading.Thread(target=h,args=(c,),daemon=True).start()
+""".trimIndent()
 
-                // 2. Setup VPN TUN interface
+                // Kill any leftover SOCKS5 from previous run
+                try {
+                    val killCh = session.openChannel("exec") as com.jcraft.jsch.ChannelExec
+                    killCh.setCommand("fuser -k $remoteSocksPort/tcp 2>/dev/null; sleep 0.2")
+                    killCh.connect(5000)
+                    Thread.sleep(500)
+                    killCh.disconnect()
+                    log("Cleaned up old SOCKS5 process")
+                } catch (_: Exception) {}
+
+                val execCh = session.openChannel("exec") as com.jcraft.jsch.ChannelExec
+                execCh.setErrStream(System.err)
+                val cmd = "python3 -c ${socksScript.replace("'", "'\\''").let { "'$it'" }} $remoteSocksPort"
+                execCh.setCommand(cmd)
+                val execIn = execCh.inputStream
+                val execErr = execCh.errStream
+                execCh.connect(10000)
+                log("SOCKS5 exec channel opened, waiting for ready signal...")
+
+                // Wait for "SOCKS5_READY" from the server (with timeout)
+                val reader = execIn.bufferedReader()
+                var readyLine: String? = null
+                val readThread = Thread {
+                    readyLine = try { reader.readLine() } catch (_: Exception) { null }
+                }
+                readThread.start()
+                readThread.join(5000)
+                if (readyLine != "SOCKS5_READY") {
+                    val errMsg = try { String(execErr.readBytes().take(500).toByteArray()) } catch (_: Exception) { "" }
+                    throw Exception("SOCKS5 server failed to start: stdout='$readyLine' stderr='$errMsg'")
+                }
+                log("Remote SOCKS5 proxy ready on server:$remoteSocksPort")
+
+                // Single local port forward → only 1 additional SSH channel
+                session.setPortForwardingL(localSocksPort, "127.0.0.1", remoteSocksPort)
+                log("Local port forward: 127.0.0.1:$localSocksPort -> server:$remoteSocksPort")
+                val socksPort = localSocksPort
+
+                // 3. Setup VPN TUN interface
                 log("Setting up VPN TUN interface...")
+
                 val builder = Builder()
                     .setSession("SSH Tunnel VPN")
                     .addAddress("10.0.0.2", 32)
-                    .addRoute("0.0.0.0", 0)
+                    .addRoute("0.0.0.0", 1)
+                    .addRoute("128.0.0.0", 1)
                     .addDnsServer(profile.dnsServer)
                     .setMtu(1500)
                     .setBlocking(true)
+
+                // Exclude our own app so SOCKS5 traffic bypasses VPN
+                try {
+                    builder.addDisallowedApplication(packageName)
+                    log("Excluded own package from VPN routes")
+                } catch (e: Exception) {
+                    log("Could not exclude own package", e)
+                }
 
                 val fd = builder.establish()
                 if (fd == null) {
@@ -232,27 +288,13 @@ class SshVpnService : VpnService() {
                 vpnFd = fd
                 log("VPN TUN interface established, fd=${fd.fd}")
 
-                // --- DIAGNOSTIC: test direct-tcpip AFTER VPN ---
-                log("=== DIAG: testing direct-tcpip AFTER VPN ===")
-                try {
-                    val testCh2 = session.openChannel("direct-tcpip") as com.jcraft.jsch.ChannelDirectTCPIP
-                    testCh2.setHost("8.8.8.8")
-                    testCh2.setPort(53)
-                    testCh2.connect(5000)
-                    log("DIAG: direct-tcpip AFTER VPN -> SUCCESS")
-                    testCh2.disconnect()
-                } catch (e: Exception) {
-                    log("DIAG: direct-tcpip AFTER VPN -> FAILED", e)
-                }
-
-                // 3. Start tunnel engine
+                // 4. Start tunnel engine (routes TUN traffic through SOCKS5)
                 log("Starting tunnel engine...")
                 val engine = TunnelEngine(
                     tunFdIn = FileInputStream(fd.fileDescriptor),
                     tunFdOut = FileOutputStream(fd.fileDescriptor),
-                    sshSession = session,
-                    dnsServer = profile.dnsServer,
-                    protectSocket = { socketFd -> protect(socketFd) }
+                    socksPort = socksPort,
+                    dnsServer = profile.dnsServer
                 )
                 tunnelEngine = engine
                 engine.start()
@@ -261,12 +303,19 @@ class SshVpnService : VpnService() {
                 updateNotification(getString(R.string.notification_connected, profile.name))
                 log("=== VPN tunnel fully established ===")
 
-                // Keep alive check
+                // Keep alive check with health monitoring
+                var lastCheck = System.currentTimeMillis()
                 while (!Thread.interrupted() && session.isConnected) {
-                    Thread.sleep(5000)
+                    Thread.sleep(2000)
+                    val now = System.currentTimeMillis()
+                    if (!session.isConnected) {
+                        log("!!! SSH session lost connectivity after ${(now - lastCheck)}ms")
+                        break
+                    }
+                    lastCheck = now
                 }
 
-                log("SSH session disconnected or thread interrupted")
+                log("SSH session disconnected or thread interrupted, isConnected=${session.isConnected}")
                 stopVpn()
 
             } catch (e: Exception) {
@@ -285,6 +334,7 @@ class SshVpnService : VpnService() {
         tunnelEngine?.stop()
         tunnelEngine = null
 
+        try { sshSession?.delPortForwardingL(10800) } catch (_: Exception) {}
         try { sshSession?.disconnect() } catch (_: Exception) {}
         sshSession = null
 

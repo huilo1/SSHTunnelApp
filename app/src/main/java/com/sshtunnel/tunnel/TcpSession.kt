@@ -24,7 +24,8 @@ class TcpSession(
     var sshOutputStream: OutputStream? = null,
     val closed: AtomicBoolean = AtomicBoolean(false)
 ) {
-    var channelObject: Any? = null // JSch Channel reference
+    var channelObject: Any? = null // Socket reference
+    val pendingData: MutableList<ByteArray> = mutableListOf()
 }
 
 enum class TcpState {
