@@ -248,6 +248,12 @@ class MainActivity : AppCompatActivity() {
         dialogBinding.inputKeyPassphrase.setText(profile.keyPassphrase)
         dialogBinding.inputDns.setText(profile.dnsServer)
 
+        if (profile.tunnelMode == com.sshtunnel.data.TunnelMode.SSH_TUN) {
+            dialogBinding.tunnelModeToggle.check(dialogBinding.btnModeTun.id)
+        } else {
+            dialogBinding.tunnelModeToggle.check(dialogBinding.btnModeSocks.id)
+        }
+
         val showPassword = {
             dialogBinding.passwordLayout.visibility = View.VISIBLE
             dialogBinding.keyLayout.visibility = View.GONE
@@ -282,6 +288,8 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton(R.string.save) { _, _ ->
                 val authMethod = if (dialogBinding.authToggle.checkedButtonId == dialogBinding.btnAuthKey.id)
                     AuthMethod.KEY else AuthMethod.PASSWORD
+                val tunnelMode = if (dialogBinding.tunnelModeToggle.checkedButtonId == dialogBinding.btnModeTun.id)
+                    com.sshtunnel.data.TunnelMode.SSH_TUN else com.sshtunnel.data.TunnelMode.SOCKS5
 
                 val updated = profile.copy(
                     name = dialogBinding.inputName.text.toString().trim().ifEmpty { dialogBinding.inputHost.text.toString().trim() },
@@ -292,7 +300,8 @@ class MainActivity : AppCompatActivity() {
                     password = dialogBinding.inputPassword.text.toString(),
                     privateKey = dialogBinding.inputPrivateKey.text.toString(),
                     keyPassphrase = dialogBinding.inputKeyPassphrase.text.toString(),
-                    dnsServer = dialogBinding.inputDns.text.toString().trim().ifEmpty { "8.8.8.8" }
+                    dnsServer = dialogBinding.inputDns.text.toString().trim().ifEmpty { "8.8.8.8" },
+                    tunnelMode = tunnelMode
                 )
                 repo.save(updated)
                 if (isNew && repo.getAll().size == 1) {

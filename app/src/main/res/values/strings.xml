@@ -28,4 +28,6 @@
     <string name="confirm_delete">Delete server \"%s\"?</string>
     <string name="dns_server">DNS Server</string>
     <string name="dns_default">8.8.8.8</string>
+    <string name="mode_socks5">SOCKS5</string>
+    <string name="mode_ssh_tun">VPN (tun)</string>
 </resources>
