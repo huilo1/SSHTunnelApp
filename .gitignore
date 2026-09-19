@@ -12,3 +12,11 @@ local.properties
 *.apk
 *.ap_
 *.aab
+
+# Local credentials, tool permissions, and diagnostics
+.env
+.env.*
+!.env.example
+!.env.*.example
+.claude/settings.local.json
+*.log
